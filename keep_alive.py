@@ -1,18 +1,23 @@
 """
 Multi-Endpoint Keep-Alive Service
-Pings multiple RunPod serverless endpoints every 4 minutes to prevent cold starts.
-Deploy to Render.com free tier.
+Pings multiple RunPod serverless endpoints to prevent cold starts.
+Runs as a web service for Render.com free tier compatibility.
 """
 
 import os
 import time
 import logging
+import threading
 from datetime import datetime
+from flask import Flask, jsonify
 import requests
+
+app = Flask(__name__)
 
 # Configuration
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
-PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "3000"))  # 50 minutes (idle timeout is 1 hour)
+PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "3000"))  # 50 minutes
+PORT = int(os.environ.get("PORT", "10000"))
 
 # All endpoints to keep warm
 ENDPOINTS = [
@@ -28,6 +33,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Track status
+status = {"ping_count": 0, "last_ping": None, "results": {}}
+
 def ping_endpoint(endpoint_id, endpoint_name):
     """Send minimal request to keep worker warm."""
     url = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
@@ -35,8 +43,6 @@ def ping_endpoint(endpoint_id, endpoint_name):
         "Authorization": f"Bearer {RUNPOD_API_KEY}",
         "Content-Type": "application/json"
     }
-
-    # Minimal request - just 1 token to keep warm
     payload = {
         "input": {
             "prompt": "<s>[INST] Hi [/INST]",
@@ -48,21 +54,18 @@ def ping_endpoint(endpoint_id, endpoint_name):
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=120)
         data = response.json()
-
         if response.status_code == 200:
-            status = data.get("status", "unknown")
-            logger.info(f"  [{endpoint_name}] Ping OK - Status: {status}")
-            return True
+            logger.info(f"  [{endpoint_name}] Ping OK - Status: {data.get('status', 'unknown')}")
+            return "OK"
         else:
             logger.warning(f"  [{endpoint_name}] Ping returned {response.status_code}")
-            return False
-
+            return f"HTTP {response.status_code}"
     except requests.exceptions.Timeout:
-        logger.warning(f"  [{endpoint_name}] Ping timed out (model may be loading)")
-        return False
+        logger.warning(f"  [{endpoint_name}] Ping timed out")
+        return "TIMEOUT"
     except Exception as e:
         logger.error(f"  [{endpoint_name}] Ping failed: {e}")
-        return False
+        return f"ERROR: {e}"
 
 def check_health(endpoint_id, endpoint_name):
     """Check endpoint health status."""
@@ -75,22 +78,19 @@ def check_health(endpoint_id, endpoint_name):
         workers = data.get("workers", {})
         ready = workers.get("ready", 0)
         idle = workers.get("idle", 0)
-        initializing = workers.get("initializing", 0)
-
-        logger.info(f"  [{endpoint_name}] ready={ready}, idle={idle}, init={initializing}")
+        init = workers.get("initializing", 0)
+        logger.info(f"  [{endpoint_name}] ready={ready}, idle={idle}, init={init}")
         return ready > 0 or idle > 0
-
     except Exception as e:
         logger.error(f"  [{endpoint_name}] Health check failed: {e}")
         return False
 
-def main():
-    """Main keep-alive loop."""
+def keep_alive_loop():
+    """Background thread that pings endpoints."""
+    global status
     logger.info("=" * 60)
-    logger.info("Multi-Endpoint Keep-Alive Service Started")
+    logger.info("Keep-Alive Background Thread Started")
     logger.info(f"Endpoints: {len(ENDPOINTS)}")
-    for ep in ENDPOINTS:
-        logger.info(f"  - {ep['name']} ({ep['id']})")
     logger.info(f"Ping interval: {PING_INTERVAL} seconds")
     logger.info("=" * 60)
 
@@ -98,28 +98,49 @@ def main():
         logger.error("RUNPOD_API_KEY not set!")
         return
 
-    ping_count = 0
-
     while True:
-        ping_count += 1
-        logger.info(f"\n--- Ping #{ping_count} at {datetime.now().isoformat()} ---")
+        status["ping_count"] += 1
+        status["last_ping"] = datetime.now().isoformat()
+        logger.info(f"\n--- Ping #{status['ping_count']} at {status['last_ping']} ---")
 
         for endpoint in ENDPOINTS:
             ep_id = endpoint["id"]
             ep_name = endpoint["name"]
-
-            # Check health first
             is_healthy = check_health(ep_id, ep_name)
 
             if is_healthy:
-                # Send keep-alive ping
-                ping_endpoint(ep_id, ep_name)
+                result = ping_endpoint(ep_id, ep_name)
             else:
+                result = "SKIPPED (no workers)"
                 logger.info(f"  [{ep_name}] No ready workers, skipping ping")
 
-        # Wait for next ping
+            status["results"][ep_name] = result
+
         logger.info(f"\nSleeping {PING_INTERVAL} seconds until next ping...")
         time.sleep(PING_INTERVAL)
 
+@app.route("/")
+def home():
+    """Health check endpoint."""
+    return jsonify({
+        "status": "running",
+        "service": "RunPod Keep-Alive",
+        "ping_count": status["ping_count"],
+        "last_ping": status["last_ping"],
+        "endpoints": [ep["name"] for ep in ENDPOINTS],
+        "results": status["results"]
+    })
+
+@app.route("/health")
+def health():
+    """Simple health check."""
+    return "OK"
+
 if __name__ == "__main__":
-    main()
+    # Start background thread
+    thread = threading.Thread(target=keep_alive_loop, daemon=True)
+    thread.start()
+
+    # Start Flask server
+    logger.info(f"Starting web server on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT)

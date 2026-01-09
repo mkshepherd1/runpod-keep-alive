@@ -1,0 +1,15 @@
+# Render.com Blueprint
+# Deploy: Connect GitHub repo, Render auto-detects this file
+
+services:
+  - type: worker
+    name: runpod-keep-alive
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python keep_alive.py
+    envVars:
+      - key: RUNPOD_API_KEY
+        sync: false  # Set manually in Render dashboard
+      - key: PING_INTERVAL
+        value: "3000"  # 50 minutes (endpoints have 1 hour idle timeout)
